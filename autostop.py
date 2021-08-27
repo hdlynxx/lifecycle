@@ -12,7 +12,7 @@
 #     permissions and limitations under the License.
 
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import getopt, sys
 import urllib3
 import boto3
@@ -71,8 +71,10 @@ if missingConfiguration:
 def is_idle(last_activity):
     last_activity = datetime.strptime(last_activity,"%Y-%m-%dT%H:%M:%S.%fz")
     if (datetime.now() - last_activity).total_seconds() > time:
+        print('Notebook is idle. Last activity time = ', last_activity)
         return True
     else:
+        print('Notebook is not idle. Last activity time = ', last_activity)
         return False
 
 
@@ -82,39 +84,39 @@ def get_notebook_name():
         _logs = json.load(logs)
     return _logs['ResourceName']
 
-def last_kernel_execution_activity(kernel):
-    if kernel['execution_state'] != 'idle':
-        return datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%fz")
-    return kernel['last_activity'];
-
-def last_kernel_connection_activity(kernel):
-    if kernel['connections'] > 0:
-        return datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%fz")
-    return kernel['last_activity']
-
-
-last_active_time = datetime.now() - timedelta(days=3*365)
+# This is hitting Jupyter's sessions API: https://github.com/jupyter/jupyter/wiki/Jupyter-Notebook-Server-API#Sessions-API
 response = requests.get('https://localhost:'+port+'/api/sessions', verify=False)
-notebooks = response.json()
-activities = []
+data = response.json()
+if len(data) > 0:
+    for notebook in data:
+        # Idleness is defined by Jupyter
+        # https://github.com/jupyter/notebook/issues/4634
+        if notebook['kernel']['execution_state'] == 'idle':
+            if not ignore_connections:
+                if notebook['kernel']['connections'] == 0:
+                    if not is_idle(notebook['kernel']['last_activity']):
+                        idle = False
+                else:
+                    idle = False
+            else:
+                if not is_idle(notebook['kernel']['last_activity']):
+                    idle = False
+        else:
+            print('Notebook is not idle:', notebook['kernel']['execution_state'])
+            idle = False
+else:
+    client = boto3.client('sagemaker')
+    uptime = client.describe_notebook_instance(
+        NotebookInstanceName=get_notebook_name()
+    )['LastModifiedTime']
+    if not is_idle(uptime.strftime("%Y-%m-%dT%H:%M:%S.%fz")):
+        idle = False
 
-execution_activities = [('execution', last_kernel_execution_activity(n['kernel'])) for n in notebooks]
-activities.extend(execution_activities)
-
-connection_activities = [('connection', last_kernel_connection_activity(n['kernel'])) for n in notebooks if not ignore_connections]
-activities.extend(connection_activities)
-
-client = boto3.client('sagemaker')
-uptime = client.describe_notebook_instance(NotebookInstanceName=get_notebook_name())['LastModifiedTime']
-activities.append(('instance configuration', uptime.strftime("%Y-%m-%dT%H:%M:%S.%fz")))
-
-resource, last_active_time = max(activities, key=lambda x: x[1])
-
-print(f"Last activity resource={resource} time={last_active_time}")
-
-if is_idle(last_active_time):
-    print("Shutting down the instance")
+if idle:
+    print('Closing idle notebook')
     client = boto3.client('sagemaker')
     client.stop_notebook_instance(
         NotebookInstanceName=get_notebook_name()
     )
+else:
+    print('Notebook not idle. Pass.')
